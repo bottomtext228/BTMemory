@@ -1,32 +1,63 @@
 # BTMemory
 Memory library ( patches, NOPs )
+# 
 
 ```cpp
-CPatch* BTMemory::Patch(uintptr_t destination, const void* patchBytes, size_t patchSize, bool isSimple = false)
+uintptr_t FindSignature(const char* moduleName, const void* signatureString, const char* mask);
 ```
 ```cpp
-CPatch* BTMemory::Nop(uintptr_t destination, size_t patchSize, bool isSimple = false)
+uintptr_t FindDMAAddy(uintptr_t baseAddress, std::vector<unsigned int> offsets);
 ```
 ```cpp
-void BTMemory::CPatch::ApplyPatch();
+void UnpatchAll();
+```
+
+
+# BTMemory::Patcher
+```cpp
+CPatch* BTMemory::Patcher::Patch(uintptr_t destination, const void* patchBytes, size_t patchSize, bool isSimple = false);
 ```
 ```cpp
-void BTMemory::CPatch::RestorePatch();
+CPatch* BTMemory::Patcher::Nop(uintptr_t destination, size_t patchSize, bool isSimple = false);
 ```
 ```cpp
-void BTMemory::CPatch::DestroyPatch();
+void BTMemory::Patcher::CPatch::ApplyPatch();
+```
+```cpp
+void BTMemory::Patcher::CPatch::RestorePatch();
+```
+```cpp
+void BTMemory::Patcher::CPatch::DestroyPatch();
+```
+
+# BTMemory::VMTHooker 
+```cpp
+BTMemory::VMTHooker::CVMTHook* BTMemory::VMTHooker::Hook(void *pVMT, int iMethodIndex, void *fnHook);
+```
+```cpp
+void *BTMemory::VMTHooker::CVMTHook::ApplyHook()
+```
+```cpp
+void *BTMemory::VMTHooker::CVMTHook::DestroyHook();
+```
+```cpp
+int BTMemory::VMTHooker::CVMTHook::GetMethodsCount();
 ```
 
 # Example:
 ```cpp
+#include "BTMemory.h"
+
+
 // Assault Cube no recoil
 DWORD WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpReserved) {
 	switch (dwReason) {
 	case DLL_PROCESS_ATTACH:
-		static BTMemory::CPatch* noRecoilNop = BTMemory::Nop((DWORD)GetModuleHandle(NULL) + 0x63786, 10); // nop the function call
+		static auto* noRecoilNop = BTMemory::Patcher::Nop((DWORD)GetModuleHandle(NULL) + 0x63786, 10); // nop the function call
 		// or
 		//static BTMemory::CPatch* noRecoilPatch = BTMemory::Patch((DWORD)GetModuleHandle(NULL) + 0x62020, "\xC2\x80\x00", 3); // "ret 08" to prevent execution of function
 		noRecoilNop->ApplyPatch();
+
 	
 		break;
 	case DLL_PROCESS_DETACH:
