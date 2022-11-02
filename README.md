@@ -1,5 +1,5 @@
 # BTMemory
-Memory library ( patches, NOPs )
+x86-x64 Memory library ( patches, NOPs, hooks )
 # 
 
 ```cpp
@@ -35,14 +35,22 @@ void BTMemory::Patcher::CPatch::DestroyPatch();
 BTMemory::VMTHooker::CVMTHook* BTMemory::VMTHooker::Hook(void *pVMT, int iMethodIndex, void *fnHook);
 ```
 ```cpp
-void *BTMemory::VMTHooker::CVMTHook::ApplyHook()
+void *BTMemory::VMTHooker::CVMTHook::ApplyHook();
 ```
 ```cpp
 void *BTMemory::VMTHooker::CVMTHook::DestroyHook();
 ```
+# BTMemory::Hooker
 ```cpp
-int BTMemory::VMTHooker::CVMTHook::GetMethodsCount();
+CHook* BTMemory::Hooker::Hook(void* fnToHook, void* fnHookCallback, HookType hookType, size_t hookSize = 5);
 ```
+```cpp
+void* BTMemory::Hooker::CHook::ApplyHook();
+```
+```cpp
+void BTMemory::Hooker::CHook::DestroyHook();
+```
+
 
 # Example:
 ```cpp
