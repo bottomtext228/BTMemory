@@ -1,15 +1,80 @@
+#define _CRT_SECURE_NO_WARNINGS
 #include "BTMemory.h"
+
+
+#ifdef _WIN64
+
+typedef void(__fastcall* _hk)();
+
+_hk o_func;
+
+// called when shooting 
+void __fastcall hkCallback() {
+	printf("BTMemory.dll\n");
+	return o_func();
+}
+
+
+#else
+
+typedef int(__cdecl* _hk)(char*);
+
+_hk o_func;
+
+
+int __cdecl hkCallback(char* argList) {
+	printf("BTMemory.dll\n");
+	return o_func(argList);
+}
+
+
+#endif
+
+
+
+DWORD WINAPI MainThread(HINSTANCE hDll) {
+
+#ifdef _WIN64
+	auto sigResult = BTMemory::FindSignature("Learning'n'Tests.exe", "\x48\x8d\x0d\x00\x00\x00\x00\xe8\x00\x00\x00\x00\x33\xff", "xxx????x????xx");
+
+	o_func = (_hk)BTMemory::Hooker::Hook((void*)(sigResult - 0x2C), (void*)hkCallback, BTMemory::Hooker::HookType::TRAMPOLINE, 5)->ApplyHook();
+	
+#else
+	/* x86 tested on Assault Cube 1.2.0.2 */
+	// no recoil 
+	static auto* noRecoilNop = BTMemory::Patcher::Nop((DWORD)GetModuleHandle(NULL) + 0x63786, 10); // nop the function call
+	//or
+	//static BTMemory::CPatch* noRecoilPatch = BTMemory::Patch((DWORD)GetModuleHandle(NULL) + 0x62020, "\xC2\x80\x00", 3); // "ret 08" to prevent execution of function
+
+	noRecoilNop->ApplyPatch();
+
+	// callled when shooting 
+	o_func = (_hk)BTMemory::Hooker::Hook((void*)0x460840, (void*)hkCallback, BTMemory::Hooker::HookType::TRAMPOLINE, 6)->ApplyHook();
+#endif
+
+
+	Sleep(60000);
+
+	FreeLibraryAndExitThread(hDll, 0);
+
+	return 0;
+}
 
 
 // Assault Cube no recoil
 DWORD WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpReserved) {
 	switch (dwReason) {
 	case DLL_PROCESS_ATTACH:
-		static auto* noRecoilNop = BTMemory::Patcher::Nop((DWORD)GetModuleHandle(NULL) + 0x63786, 10); // nop the function call
-		// or
-		//static BTMemory::CPatch* noRecoilPatch = BTMemory::Patch((DWORD)GetModuleHandle(NULL) + 0x62020, "\xC2\x80\x00", 3); // "ret 08" to prevent execution of function
-		noRecoilNop->ApplyPatch();
-	
+		CreateThread(0, 0, (LPTHREAD_START_ROUTINE)MainThread, hInstance, 0, 0);
+		if (AllocConsole()) {
+		
+			(void)freopen("CONIN$", "r", stdin);
+			(void)freopen("CONOUT$", "w", stdout);
+			(void)freopen("CONOUT$", "w", stderr);
+			printf("INJECTED!\n");
+
+		}
+
 		break;
 	case DLL_PROCESS_DETACH:
 		BTMemory::UnpatchAll(); // restore original bytes and deletes allocated memory for them

@@ -1,14 +1,10 @@
+
 #pragma once
 #include <Windows.h>
 #include <vector>
-#include <psapi.h>
 
-#define k_page_writeable (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)
-#define k_page_readable (k_page_writeable|PAGE_READONLY|PAGE_WRITECOPY|PAGE_EXECUTE_READ|PAGE_EXECUTE_WRITECOPY)
-#define k_page_offlimits (PAGE_GUARD|PAGE_NOACCESS)
 
 namespace BTMemory {
-
 	namespace Hooker {
 		enum class HookType {
 			DETOUR, // jmp 
@@ -20,9 +16,15 @@ namespace BTMemory {
 		class CHook {
 			const uintptr_t m_fnHookCallback;
 			const uintptr_t m_pToHook;
-			uintptr_t m_fnOriginal = 0;
+			uint32_t m_fnOriginal = 0;
 			BYTE* m_pOriginalBytes = 0;
-			const size_t m_uHookSize;
+			BYTE* m_pPrologueBytes = 0;
+			size_t m_uHookSize;
+			bool m_bHookAbove = false;
+#ifdef _WIN64
+			uintptr_t m_pInterlayer = 0;
+#endif // _WIN64
+
 			const HookType m_hookType;
 			static std::vector<CHook*> pHooks;
 		public:
@@ -64,9 +66,20 @@ namespace BTMemory {
 				if (m_hookType == HookType::TRAMPOLINE || m_hookType == HookType::DETOUR) { // both have similar working method
 					DWORD oldProtect;
 					VirtualProtect((void*)m_pToHook, m_uHookSize, PAGE_EXECUTE_READWRITE, &oldProtect);
-					memcpy((void*)m_pToHook, m_pOriginalBytes, m_uHookSize); // restore the original code of the function
+					if (m_bHookAbove) {
+						*reinterpret_cast<uint32_t*>(m_pToHook + 1) = m_fnOriginal; //  // restore the original relative address  (same method for x86/x64)
+					}
+					else {
+						memcpy((void*)m_pToHook, m_pOriginalBytes, m_uHookSize); // restore the original code of the function
+					}
 					VirtualProtect((void*)m_pToHook, m_uHookSize, oldProtect, &oldProtect);
 					VirtualFree(m_pOriginalBytes, NULL, MEM_RELEASE);  // delete allocated memory for original code/trampoline
+					if (m_bHookAbove) {
+						//	VirtualFree((void*)m_pInterlayer, NULL, MEM_RELEASE); // TODO: decide what to do with that
+					}
+					if (m_pPrologueBytes) {
+						VirtualFree(m_pPrologueBytes, NULL, MEM_RELEASE);
+					}
 
 				}
 				auto index = std::find(pHooks.begin(), pHooks.end(), this); // if we are destroying the hook we should erase him from the hooks array 
@@ -78,14 +91,88 @@ namespace BTMemory {
 
 			}
 		private:
+
+#ifdef _WIN64
+
+
+			inline uintptr_t findNextFreeMemory(std::uintptr_t from, std::uintptr_t to, std::uintptr_t granularity) {
+				// credit to kin4stat
+				to -= to % granularity; // alignment
+				to -= granularity;
+				while (from < to) {
+					MEMORY_BASIC_INFORMATION mbi;
+					if (VirtualQuery(reinterpret_cast<void*>(to), &mbi, sizeof(mbi)) == 0) break;
+					if (mbi.State == MEM_FREE) return to;
+					if (reinterpret_cast<std::uintptr_t>(mbi.AllocationBase) < granularity) break;
+					to = reinterpret_cast<std::uintptr_t>(mbi.AllocationBase) - granularity;
+				}
+				return 0;
+			}
+
+
+			uintptr_t getFreeMemoryForJmp(uintptr_t m_pToHook) {
+				// if we do a 5 byte jmp, which can't jump very far in x64, we should find a free memory in range of max 5 byte jump length
+			
+				uintptr_t freeMemory = 0;
+				uintptr_t findFromMemory = m_pToHook - 0x7FFFFFFF - 1; 	// not sure about this, but we can only jmp in 2^31 - 1 range up or down, right?
+				uintptr_t allocatedMemory = freeMemory;
+
+				freeMemory = findNextFreeMemory(findFromMemory, m_pToHook + 0x7FFFFFFF - 1, 1);
+				if (freeMemory) {
+					allocatedMemory = (uintptr_t)VirtualAlloc((void*)freeMemory, 1024, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+					if (!allocatedMemory) { // maybe if it was already allocated 
+						freeMemory += 1; 
+						while (!(isAddressExecutable(freeMemory) && *reinterpret_cast<int*>(freeMemory) == 0)) {
+							freeMemory += 14; // long jmp size
+							/* This is maybe bad, that was done if we inject two and more dlls with this library they can hook all together.
+							* We iterate through other hooks until find free allocated memory (*reinterpret_cast<int*>(freeMemory) == 0)  
+							* It's just works
+							*/
+						}
+						return freeMemory;
+					}
+					else {
+						return allocatedMemory;
+					}
+
+				}
+
+
+				return 0;
+			}
+
+			bool isAddressExecutable(uintptr_t address) {
+				MEMORY_BASIC_INFORMATION mbi;
+				if (!VirtualQuery((void*)address, &mbi, sizeof(mbi))) return false;
+				if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
+				return (mbi.Protect & PAGE_EXECUTE_READWRITE);
+			}
+
+			int64_t SignExtend(uint32_t n) {
+				// to calculate absolute address from relative: RIP = RIP + 32-bit displacement sign extended to 64-bits
+				return (int64_t)n | 0xFFFFFFFF00000000;
+			}
+
+
+#endif // _WIN64
+
 			void* InstallTrampolineHook() {
 
 				InstallDetourHook();
 #ifdef _WIN64
-				* reinterpret_cast<WORD*>(m_pOriginalBytes + m_uHookSize) = 0x25FF;
-				*reinterpret_cast<uint32_t*>(m_pOriginalBytes + m_uHookSize + 2) = 0x0;
-				*reinterpret_cast<uintptr_t*>(m_pOriginalBytes + m_uHookSize + 6) = m_pToHook + 14; // jmp to original function 
+
+				uintptr_t jumpBackOffset = m_uHookSize;
+
+				if (m_bHookAbove) {
+					jumpBackOffset += 9; // 14 - 5
+
+				}
+
+				*reinterpret_cast<WORD*>(m_pOriginalBytes + jumpBackOffset) = 0x25FF;
+				*reinterpret_cast<uint32_t*>(m_pOriginalBytes + jumpBackOffset + 2) = 0x0;
+				*reinterpret_cast<uintptr_t*>(m_pOriginalBytes + jumpBackOffset + 6) = m_pToHook + m_uHookSize; // jmp to original function 
 #else
+
 				* reinterpret_cast<BYTE*>(m_pOriginalBytes + m_uHookSize) = 0xE9;
 				*reinterpret_cast<uintptr_t*>(m_pOriginalBytes + m_uHookSize + 1) = m_pToHook - (uintptr_t)m_pOriginalBytes - m_uHookSize; // jmp to original function 
 #endif
@@ -106,33 +193,71 @@ namespace BTMemory {
 			}
 #endif
 
+
+
+
 			void InstallDetourHook() {
-				size_t memoryToAllocate = m_uHookSize;
-				if (m_hookType == HookType::TRAMPOLINE) {
-#ifdef _WIN64
-					memoryToAllocate += 14;
-#else 
-					memoryToAllocate += 5; // for jmp 
-#endif
-				}
+				size_t memoryToNop = m_uHookSize;
 				DWORD oldProtect;
 
-				m_pOriginalBytes = (BYTE*)VirtualAlloc(0, memoryToAllocate, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE); // FIXED bug with non executable(access error) trampoline
-
+				m_pOriginalBytes = (BYTE*)VirtualAlloc(0, m_uHookSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 				if (!m_pOriginalBytes) {
 					return; // sad
 				}
+
 				VirtualProtect((void*)m_pToHook, m_uHookSize, PAGE_EXECUTE_READWRITE, &oldProtect);
 				memcpy(m_pOriginalBytes, (void*)m_pToHook, m_uHookSize); // copy original bytes
 
-				memset((void*)(m_pToHook), 0x90, m_uHookSize); // fill with nops in case if we replace some bytes
+				if (*reinterpret_cast<BYTE*>(m_pToHook) == 0xE9) { // was hooked
+					m_bHookAbove = true;
+					uint32_t relativeAddress = *reinterpret_cast<uint32_t*>(m_pToHook + 1);
+					m_fnOriginal = relativeAddress;
+#if _WIN64
+					uintptr_t absoluteAddress = m_pToHook + SignExtend(relativeAddress) + 5;
+					*reinterpret_cast<WORD*>(m_pOriginalBytes) = 0x25FF;
+					*reinterpret_cast<uint32_t*>(m_pOriginalBytes + 2) = 0x0;
+					*reinterpret_cast<uintptr_t*>(m_pOriginalBytes + 6) = absoluteAddress;
+
+#else	
+					uintptr_t absoluteAddress = m_pToHook + relativeAddress + 5;
+					*reinterpret_cast<BYTE*>(m_pOriginalBytes) = 0xE9;
+					*reinterpret_cast<uint32_t*>(m_pOriginalBytes + 1) = absoluteAddress - (uintptr_t)m_pOriginalBytes - 5;
+#endif // _WIN64
+				}
+
+
+				memset((void*)(m_pToHook), 0x90, memoryToNop); // fill with nops in case if we replace some bytes
 
 #ifdef _WIN64
-				* reinterpret_cast<WORD*>(m_pToHook) = 0x25FF;
-				*reinterpret_cast<uint32_t*>(m_pToHook + 2) = 0x0;
-				*reinterpret_cast<uintptr_t*>(m_pToHook + 6) = m_fnHookCallback;
+
+			
+				auto freeMemory = getFreeMemoryForJmp(m_pToHook);
+
+		
+				if (freeMemory) {
+
+					m_pInterlayer = freeMemory;
+
+					// place 5 bytes jump to the interlayer with 14 long bytes jump
+					*reinterpret_cast<BYTE*>(m_pToHook) = 0xE9;
+					*reinterpret_cast<uint32_t*>(m_pToHook + 1) = (uint32_t)(m_pInterlayer - m_pToHook - 5);
+
+					*reinterpret_cast<WORD*>(m_pInterlayer) = 0x25FF;
+					*reinterpret_cast<uint32_t*>(m_pInterlayer + 2) = 0x0;
+					*reinterpret_cast<uintptr_t*>(m_pInterlayer + 6) = m_fnHookCallback;
+				}
+				else {
+					// place long 14 bytes jump 
+					/*
+					* if we couldn't find memory for 5 byte jmp. This won't be work actually and it will crush because for example, we set hook size for 5, but we coudn't find free memory
+					so hook is 14 size now, but we can (90%) brake assembler listing after that. So, what to do with that?
+					*/
+					*reinterpret_cast<WORD*>(m_pToHook) = 0x25FF;
+					*reinterpret_cast<uint32_t*>(m_pToHook + 2) = 0x0;
+					*reinterpret_cast<uintptr_t*>(m_pToHook + 6) = m_fnHookCallback;
+				}
 #else
-				* reinterpret_cast<BYTE*>(m_pToHook) = 0xE9;
+				*reinterpret_cast<BYTE*>(m_pToHook) = 0xE9;
 				*reinterpret_cast<uint32_t*>(m_pToHook + 1) = m_fnHookCallback - m_pToHook - 5;
 #endif // WIN64
 
@@ -142,13 +267,9 @@ namespace BTMemory {
 			friend void UnhookAll();
 		};
 		std::vector<CHook*> CHook::pHooks;
-		// ApplyHook() & DestroyHook() | in x86 minimal hook size is 5 bytes, in x64 is 14 bytes
+		// ApplyHook() & DestroyHook() | in x86 minimal hook size is 5 bytes, in x64 with some tricks too
 		CHook* Hook(void* fnToHook, void* fnHookCallback, HookType hookType, size_t hookSize = 5) {
-#ifdef _WIN64
-			constexpr size_t minimalHookSize = 14; // 0xFF 0x25 0x00 0x00 0x00 0x00 + 8 byte address
-#else 
 			constexpr size_t minimalHookSize = 5; // 0xE9 + 4 byte address
-#endif
 			if (hookSize < minimalHookSize) {
 				return nullptr; // maybe assert()?
 			}
