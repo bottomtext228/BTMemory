@@ -74,9 +74,9 @@ namespace BTMemory {
 					}
 					VirtualProtect((void*)m_pToHook, m_uHookSize, oldProtect, &oldProtect);
 					VirtualFree(m_pOriginalBytes, NULL, MEM_RELEASE);  // delete allocated memory for original code/trampoline
-					if (m_bHookAbove) {
-						//	VirtualFree((void*)m_pInterlayer, NULL, MEM_RELEASE); // TODO: decide what to do with that
-					}
+#ifdef _WIN64
+					VirtualFree((void*)m_pInterlayer, NULL, MEM_RELEASE);
+#endif
 					if (m_pPrologueBytes) {
 						VirtualFree(m_pPrologueBytes, NULL, MEM_RELEASE);
 					}
@@ -96,7 +96,23 @@ namespace BTMemory {
 
 
 			inline uintptr_t findNextFreeMemory(std::uintptr_t from, std::uintptr_t to, std::uintptr_t granularity) {
-				// credit to kin4stat
+
+				from -= from % granularity; // alignment
+				from += granularity;
+				while (from <= to) {
+					MEMORY_BASIC_INFORMATION mbi;
+					if (VirtualQuery(reinterpret_cast<void*>(from), &mbi, sizeof(mbi)) == 0) break;
+					if (mbi.State == MEM_FREE) return from;
+					if (reinterpret_cast<std::uintptr_t>(mbi.AllocationBase) < granularity) break;
+					from = reinterpret_cast<std::uintptr_t>(mbi.AllocationBase) + mbi.RegionSize;
+
+					from += granularity - 1;
+					from -= from % granularity;
+				}
+				return 0;
+			}
+
+			inline uintptr_t findPrevFreeMemory(std::uintptr_t from, std::uintptr_t to, std::uintptr_t granularity) {
 				to -= to % granularity; // alignment
 				to -= granularity;
 				while (from < to) {
@@ -109,36 +125,47 @@ namespace BTMemory {
 				return 0;
 			}
 
+			void* getFreeMemoryForJmp(uintptr_t address) {
+				// credit to kin4stat
+				constexpr auto kMaxMemoryRange = 0x40000000; // 1gb
+				constexpr auto kMemoryBlockSize = 0x1000;    // windows page size
+				SYSTEM_INFO si;
+				GetSystemInfo(&si);
+				std::uintptr_t min_address = reinterpret_cast<std::uintptr_t>(si.lpMinimumApplicationAddress);
+				std::uintptr_t max_address = reinterpret_cast<std::uintptr_t>(si.lpMaximumApplicationAddress);
 
-			uintptr_t getFreeMemoryForJmp(uintptr_t m_pToHook) {
-				// if we do a 5 byte jmp, which can't jump very far in x64, we should find a free memory in range of max 5 byte jump length
-			
-				uintptr_t freeMemory = 0;
-				uintptr_t findFromMemory = m_pToHook - 0x7FFFFFFF - 1; 	// not sure about this, but we can only jmp in 2^31 - 1 range up or down, right?
-				uintptr_t allocatedMemory = freeMemory;
+				if (kMaxMemoryRange <= address && min_address < address - kMaxMemoryRange) min_address = address - kMaxMemoryRange;
 
-				freeMemory = findNextFreeMemory(findFromMemory, m_pToHook + 0x7FFFFFFF - 1, 1);
-				if (freeMemory) {
-					allocatedMemory = (uintptr_t)VirtualAlloc((void*)freeMemory, 1024, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-					if (!allocatedMemory) { // maybe if it was already allocated 
-						freeMemory += 1; 
-						while (!(isAddressExecutable(freeMemory) && *reinterpret_cast<int*>(freeMemory) == 0)) {
-							freeMemory += 14; // long jmp size
-							/* This is maybe bad, that was done if we inject two and more dlls with this library they can hook all together.
-							* We iterate through other hooks until find free allocated memory (*reinterpret_cast<int*>(freeMemory) == 0)  
-							* It's just works
-							*/
-						}
-						return freeMemory;
+				if (address + kMaxMemoryRange <= max_address) max_address = address + kMaxMemoryRange;
+
+				// Make room for one page
+				max_address -= kMemoryBlockSize - 1;
+
+				void* result = nullptr;
+				{
+					std::uintptr_t alloc = address;
+					while (min_address <= alloc) {
+						alloc = findPrevFreeMemory(min_address, alloc, si.dwAllocationGranularity);
+						if (alloc == 0) break;
+
+						result = VirtualAlloc(reinterpret_cast<void*>(alloc), kMemoryBlockSize, MEM_COMMIT | MEM_RESERVE,
+							PAGE_EXECUTE_READWRITE);
+						if (result != nullptr) break;
 					}
-					else {
-						return allocatedMemory;
-					}
-
 				}
+				if (result == nullptr) {
+					std::uintptr_t alloc = address;
+					while (alloc <= max_address) {
+						alloc = findNextFreeMemory(alloc, max_address, si.dwAllocationGranularity);
+						if (alloc == 0) break;
 
+						result = VirtualAlloc(reinterpret_cast<void*>(alloc), kMemoryBlockSize, MEM_COMMIT | MEM_RESERVE,
+							PAGE_EXECUTE_READWRITE);
+						if (result != nullptr) break;
+					}
+				}
+				return result;
 
-				return 0;
 			}
 
 			bool isAddressExecutable(uintptr_t address) {
@@ -230,10 +257,10 @@ namespace BTMemory {
 
 #ifdef _WIN64
 
-			
-				auto freeMemory = getFreeMemoryForJmp(m_pToHook);
+				// TODO: check with multiple dlls
+				auto freeMemory = (uintptr_t)getFreeMemoryForJmp(m_pToHook);
 
-		
+
 				if (freeMemory) {
 
 					m_pInterlayer = freeMemory;
@@ -257,7 +284,7 @@ namespace BTMemory {
 					*reinterpret_cast<uintptr_t*>(m_pToHook + 6) = m_fnHookCallback;
 				}
 #else
-				*reinterpret_cast<BYTE*>(m_pToHook) = 0xE9;
+				* reinterpret_cast<BYTE*>(m_pToHook) = 0xE9;
 				*reinterpret_cast<uint32_t*>(m_pToHook + 1) = m_fnHookCallback - m_pToHook - 5;
 #endif // WIN64
 
